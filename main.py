@@ -552,8 +552,8 @@ class PDFStamperApp:
                     can.drawImage(
                         ImageReader(stamp_img), 
                         seal_pos['x'], 
-                        page_height - seal_pos['y'],  # Convert from top-left to bottom-left coordinates
-                        width=seal_pos['width'], 
+                        max(0, page_height - seal_pos['y']),  # Convert from top-left to bottom-left coordinates, safety clamp to page bottom
+                        width=seal_pos['width'],
                         height=seal_pos['height'], 
                         mask='auto'
                     )

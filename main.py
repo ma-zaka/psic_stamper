@@ -7,13 +7,55 @@ import io
 import re
 import pdfplumber
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from datetime import datetime
 import tempfile
 
 # Import the database manager
 from db_manager import DatabaseManager
+
+# Minimum inset from page edges so the stamp stays fully visible (points).
+_SEAL_PAGE_MARGIN = 0.5
+
+
+def compute_seal_stamp_placement(
+    line_top,
+    line_bottom,
+    line_left,
+    stamp_w,
+    stamp_h,
+    page_w,
+    page_h,
+    margin=_SEAL_PAGE_MARGIN,
+):
+    """
+    Decide stamp (x, top_y) in pdfplumber coordinates (origin top-left, y down).
+    Primary: top of stamp at line_bottom (directly below anchor text).
+    Secondary: if that would extend past the bottom edge, place above (bottom of stamp at line_top).
+    Then clamp so the stamp box stays inside the page; overlap with text is allowed.
+    """
+    m = margin
+    max_top = page_h - stamp_h - m
+    min_top = m
+
+    # Primary — below anchor
+    top_below = line_bottom
+    bottom_below = top_below + stamp_h
+    fits_below = bottom_below <= page_h - m + 1e-9
+
+    if fits_below:
+        top_y = top_below
+    else:
+        # Secondary — above anchor (bottom edge of stamp at line_top)
+        top_y = line_top - stamp_h
+
+    top_y = max(min_top, min(top_y, max_top))
+
+    x = line_left
+    x = max(m, min(x, page_w - stamp_w - m))
+
+    return x, top_y
+
 
 class PDFStamperApp:
     def __init__(self, root):
@@ -57,21 +99,19 @@ class PDFStamperApp:
         self.admin_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.admin_tab, text="Agency Management")
         
+        # Initialize status variable before setting up tabs
+        self.status_var = tk.StringVar()
+        self.refresh_db_status()
+        
+        # Status bar
+        status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
         # Set up the main processing tab
         self.setup_process_tab()
         
         # Set up the admin tab
         self.setup_admin_tab()
-        
-        # Show database connection status
-        if self.db_connected:
-            self.status_var = tk.StringVar(value="Database: Connected")
-        else:
-            self.status_var = tk.StringVar(value="Database: Disconnected")
-        
-        # Status bar
-        status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
     
     def setup_process_tab(self):
         """Set up the main PDF processing tab"""
@@ -105,6 +145,7 @@ class PDFStamperApp:
         ttk.Label(agency_frame, text="Override with agency:").grid(row=1, column=0, sticky=tk.W)
         
         # Get agencies from database
+        self.refresh_db_status()
         agencies = self.db_manager.get_all_agencies() if self.db_connected else []
         agencies.insert(0, "")  # Add empty option
         
@@ -149,6 +190,7 @@ class PDFStamperApp:
         selection_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10, padx=5)
         
         # Get agencies from database
+        self.refresh_db_status()
         agencies = self.db_manager.get_all_agencies() if self.db_connected else []
         
         # Agency selection dropdown
@@ -226,6 +268,7 @@ class PDFStamperApp:
             if success:
                 messagebox.showinfo("Success", message)
                 # Update the dropdown list
+                self.refresh_db_status()
                 agencies = self.db_manager.get_all_agencies()
                 self.admin_agency_combo['values'] = agencies
                 self.agency_combo['values'] = [""] + agencies
@@ -261,6 +304,8 @@ class PDFStamperApp:
             agencies = self.db_manager.get_all_agencies()
             self.admin_agency_combo['values'] = agencies
             self.agency_combo['values'] = [""] + agencies
+            # Refresh connection status
+            self.refresh_db_status()
         else:
             messagebox.showerror("Error", message)
     
@@ -439,34 +484,44 @@ class PDFStamperApp:
         date_page = None
         
         with pdfplumber.open(pdf_path) as pdf:
-            # Determine which pages to check
+            # "Seal of PSIA": first occurrence only; place stamp just under the phrase (not a fixed large drop).
+            for page_idx in range(len(pdf.pages)):
+                page = pdf.pages[page_idx]
+                words = page.extract_words()
+                for i, word in enumerate(words):
+                    if word['text'] != "Seal":
+                        continue
+                    if i + 2 >= len(words):
+                        continue
+                    if words[i + 1]['text'] != "of" or words[i + 2]['text'] != "PSIA":
+                        continue
+                    w0, w1, w2 = words[i], words[i + 1], words[i + 2]
+                    line_top = min(w0['top'], w1['top'], w2['top'])
+                    line_bottom = max(w0['bottom'], w1['bottom'], w2['bottom'])
+                    line_left = min(w0['x0'], w1['x0'], w2['x0'])
+                    seal_pos = {
+                        'line_top': line_top,
+                        'line_bottom': line_bottom,
+                        'line_left': line_left,
+                        'width': 130,
+                        'height': 130,
+                    }
+                    seal_page = page_idx
+                    break
+                else:
+                    continue
+                break
+
+            # Signature / Date: last pages (same as before)
             if len(pdf.pages) >= 2:
                 pages_to_check = [len(pdf.pages) - 2, len(pdf.pages) - 1]
             else:
                 pages_to_check = [len(pdf.pages) - 1]
-            
+
             for page_idx in pages_to_check:
                 page = pdf.pages[page_idx]
-                
-                # Extract text with position information
                 words = page.extract_words()
-                
-                # Look for "Seal of PSIA" text
-                for i, word in enumerate(words):
-                    if word['text'] == "Seal":
-                        # Check if the next word is "of PSIA"
-                        if i + 1 < len(words) and words[i + 1]['text'] == "of":
-                            if i + 2 < len(words) and words[i + 2]['text'] == "PSIA":
-                                # Found "Seal of PSIA"
-                                seal_pos = {
-                                    'x': word['x0'] + 30,
-                                    'y': word['top'] + 120,  # Position below the text
-                                    'width': 130,
-                                    'height': 130
-                                }
-                                seal_page = page_idx
-                                break
-                
+
                 # Look for "Signature" text
                 for word in words:
                     if word['text'] == "Signature":
@@ -525,12 +580,11 @@ class PDFStamperApp:
             # Process each page
             for i, page in enumerate(pdf_reader.pages):
                 # Create a new PDF to overlay on the current page
-                packet = io.BytesIO()
-                can = canvas.Canvas(packet, pagesize=letter)
-                
-                # Get page dimensions
+                # Match overlay size to this page so coordinates align (A4, Letter, etc.).
                 page_width = float(page.mediabox.width)
                 page_height = float(page.mediabox.height)
+                packet = io.BytesIO()
+                can = canvas.Canvas(packet, pagesize=(page_width, page_height))
                 
                 # Flag to check if we need to add any overlay
                 add_overlay = False
@@ -547,14 +601,24 @@ class PDFStamperApp:
                     )
                     add_overlay = True
                 
-                # Add stamp (seal) if position was found and this is the right page
+                # Stamp: same page index as anchor; placement from compute_seal_stamp_placement.
                 if seal_pos and i == seal_page:
+                    sx, stamp_top_y = compute_seal_stamp_placement(
+                        seal_pos['line_top'],
+                        seal_pos['line_bottom'],
+                        seal_pos['line_left'],
+                        seal_pos['width'],
+                        seal_pos['height'],
+                        page_width,
+                        page_height,
+                    )
+                    stamp_bottom_y = page_height - stamp_top_y - seal_pos['height']
                     can.drawImage(
-                        ImageReader(stamp_img), 
-                        seal_pos['x'], 
-                        max(0, page_height - seal_pos['y']),  # Convert from top-left to bottom-left coordinates, safety clamp to page bottom
+                        ImageReader(stamp_img),
+                        sx,
+                        stamp_bottom_y,
                         width=seal_pos['width'],
-                        height=seal_pos['height'], 
+                        height=seal_pos['height'],
                         mask='auto'
                     )
                     add_overlay = True
@@ -598,6 +662,15 @@ class PDFStamperApp:
             
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
+
+    def refresh_db_status(self):
+        """Update the database connection status display"""
+        if self.db_manager.is_connected():
+            self.status_var.set("Database: Connected")
+            self.db_connected = True
+        else:
+            self.status_var.set("Database: Disconnected")
+            self.db_connected = False
     
     def __del__(self):
         """Clean up resources when the app is closed"""

@@ -14,9 +14,17 @@ class DatabaseManager:
         self.temp_files = []
     
     def connect(self, connection_string="mongodb://localhost:27017/"):
-        """Connect to MongoDB database"""
+        """Connect to MongoDB database with timeout and health check"""
         try:
-            self.client = pymongo.MongoClient(connection_string)
+            # Set a short timeout (2s) for connection and server selection to prevent app freezing
+            self.client = pymongo.MongoClient(
+                connection_string,
+                serverSelectionTimeoutMS=2000,
+                connectTimeoutMS=2000
+            )
+            # Try to ping the server to verify the connection is actually working
+            self.client.admin.command('ping')
+            
             self.db = self.client["pdf_stamper"]
             self.agencies_collection = self.db["agencies"]
             self.fs = gridfs.GridFS(self.db)
@@ -25,15 +33,24 @@ class DatabaseManager:
         except Exception as e:
             print(f"Database connection error: {str(e)}")
             self.connected = False
+            self.client = None
             return False
     
     def is_connected(self):
-        """Check if connected to database"""
-        return self.connected
+        """Check if connected to database and still alive using a ping"""
+        if not self.connected or not self.client:
+            return False
+        try:
+            # Verify the connection is still active with a quick ping
+            self.client.admin.command('ping')
+            return True
+        except Exception:
+            self.connected = False
+            return False
     
     def add_update_agency(self, agency_name, signature_path, stamp_path):
         """Add or update an agency in the database"""
-        if not self.connected:
+        if not self.is_connected():
             return False, "Database not connected"
         
         try:
@@ -84,7 +101,7 @@ class DatabaseManager:
     
     def get_agency_assets(self, agency_name):
         """Get signature and stamp images for an agency"""
-        if not self.connected:
+        if not self.is_connected():
             return False, "Database not connected", None, None
         
         try:
@@ -130,7 +147,7 @@ class DatabaseManager:
     
     def get_all_agencies(self):
         """Get a list of all agency names"""
-        if not self.connected:
+        if not self.is_connected():
             return []
         
         try:
@@ -142,7 +159,7 @@ class DatabaseManager:
     
     def delete_agency(self, agency_name):
         """Delete an agency from the database"""
-        if not self.connected:
+        if not self.is_connected():
             return False, "Database not connected"
         
         try:
